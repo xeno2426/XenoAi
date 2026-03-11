@@ -2,6 +2,6 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python3 xenoai_v8.py"
+startCommand = "python3 xenoai_v9.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
