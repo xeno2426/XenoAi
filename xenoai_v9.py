@@ -243,6 +243,26 @@ NEVER give up without explaining WHY it failed.
 - If package failed, use stdlib alternative
 - Add /health route to every Flask app
 
+FULL-STACK RULE (CRITICAL):
+When user asks to build any "app", "tool", "website", "dashboard", "tracker", "manager":
+ALWAYS build BOTH:
+  1. backend: app.py (Flask + SQLite, full REST API, /health endpoint)
+  2. frontend: index.html (served by Flask at '/', beautiful UI using frontend-design skill)
+     - Single self-contained HTML file with CSS in <style> and JS in <script>
+     - Fetch data from the Flask API using fetch()
+     - NO separate CSS/JS files
+     - Use Google Fonts, CSS variables, smooth animations
+     - Mobile responsive
+
+Flask must serve index.html at the root route:
+  @app.route('/')
+  def home(): return send_file('index.html')
+
+ONLY build API-only (no frontend) if user explicitly says:
+  "just the API", "backend only", "REST API", "no frontend"
+
+Otherwise: ALWAYS fullstack. No exceptions.
+
 ━━━ PHASE 7: AUTO-TEST ━━━
 After writing code, test it:
   python3 -c "import py_compile; py_compile.compile('app.py')"
@@ -1086,10 +1106,15 @@ function addMsg(role, text){
       body.querySelectorAll('pre code').forEach(b=>{
         hljs.highlightElement(b);
         var lang = b.className||'';
-        if(lang.match(/html|css|javascript|js/i)||(b.textContent.trim().startsWith('<'))){
+        var code = b.textContent.trim();
+        // Only show preview for HTML — must have class language-html OR start with <!DOCTYPE or <html
+        var isHtml = lang.match(/language-html/i) || code.toLowerCase().startsWith('<!doctype') || code.toLowerCase().startsWith('<html');
+        // Explicitly block Python, bash, shell, JSON, etc
+        var isCode = lang.match(/language-(python|py|bash|sh|shell|json|yaml|sql|java|cpp|c|rust|go|ts|tsx|jsx|css|scss)/i);
+        if(isHtml && !isCode){
           var btn=document.createElement('button'); btn.className='preview-btn';
-          btn.innerHTML='▶ Preview'; var code=b.textContent;
-          btn.onclick=()=>openPreviewCode(code);
+          btn.innerHTML='▶ Preview HTML'; var c=code;
+          btn.onclick=()=>openPreviewCode(c);
           b.parentElement.appendChild(btn);
         }
       });
