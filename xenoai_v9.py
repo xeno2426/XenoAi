@@ -2,17 +2,74 @@
 import os, json, subprocess, requests, re, base64, uuid, time
 from datetime import datetime
 from flask import Flask, request, jsonify
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PG = True
+except ImportError:
+    HAS_PG = False
 
 app = Flask(__name__)
 GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
+
+# In-memory fallback preview store (used if no DB)
+PREVIEW_STORE = {}
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-CHATS_DIR     = os.path.join(BASE_DIR, "xenoai_chats")
 UPLOADS_DIR   = os.path.join(BASE_DIR, "xenoai_uploads")
 SKILLS_DIR    = os.path.join(BASE_DIR, "skills-main", "skills")
 PROMPTS_DIR   = os.path.join(BASE_DIR, "system-prompts-and-models-of-ai-tools-main")
 ENV_MEMORY    = os.path.join(BASE_DIR, "xenoai_env.json")
+# Legacy JSON fallback dir
+CHATS_DIR     = os.path.join(BASE_DIR, "xenoai_chats")
 os.makedirs(CHATS_DIR,   exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+DATABASE_URL = os.environ.get("DATABASE_URL","")
+
+def get_db():
+    """Get a fresh Postgres connection. Returns None if unavailable."""
+    if not HAS_PG or not DATABASE_URL: return None
+    try:
+        url = DATABASE_URL
+        # Railway uses postgres:// but psycopg2 needs postgresql://
+        if url.startswith("postgres://"): url = "postgresql://" + url[11:]
+        return psycopg2.connect(url, cursor_factory=RealDictCursor, connect_timeout=5)
+    except Exception as e:
+        print(f"DB connect error: {e}")
+        return None
+
+def init_db():
+    """Create tables if they don't exist."""
+    conn = get_db()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                title TEXT DEFAULT 'New Chat',
+                created FLOAT DEFAULT 0,
+                mode TEXT,
+                messages JSONB DEFAULT '[]'::jsonb
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS previews (
+                id TEXT PRIMARY KEY,
+                html TEXT NOT NULL,
+                created FLOAT DEFAULT 0
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ DB tables ready")
+    except Exception as e:
+        print(f"DB init error: {e}")
+        try: conn.close()
+        except: pass
+
+init_db()
 
 # ─── SKILLS LOADER ────────────────────────────────────────────────────────────
 
@@ -333,30 +390,118 @@ TECHNICAL:
 def new_chat_id():
     return datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:4]
 
-def chat_path(cid):
-    return os.path.join(CHATS_DIR, f"{cid}.json")
-
 def load_chat(cid):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM chats WHERE id=%s", (cid,))
+            row = cur.fetchone()
+            cur.close(); conn.close()
+            if row:
+                return {"id":row["id"],"title":row["title"],"created":float(row["created"] or 0),
+                        "mode":row["mode"],"messages":row["messages"] or []}
+        except Exception as e:
+            print(f"load_chat pg: {e}")
+            try: conn.close()
+            except: pass
     try:
-        p = chat_path(cid)
-        if os.path.exists(p):
-            return json.load(open(p))
+        p = os.path.join(CHATS_DIR, f"{cid}.json")
+        if os.path.exists(p): return json.load(open(p))
     except: pass
-    return {"id": cid, "title": "New Chat", "created": time.time(), "messages": [], "mode": None}
+    return {"id":cid,"title":"New Chat","created":time.time(),"messages":[],"mode":None}
 
 def save_chat(chat):
-    json.dump(chat, open(chat_path(chat["id"]), "w"), indent=2)
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO chats (id, title, created, mode, messages)
+                VALUES (%s,%s,%s,%s,%s::jsonb)
+                ON CONFLICT (id) DO UPDATE
+                SET title=EXCLUDED.title, mode=EXCLUDED.mode, messages=EXCLUDED.messages
+            """, (chat["id"], chat.get("title","New Chat"), chat.get("created",time.time()),
+                  chat.get("mode"), json.dumps(chat.get("messages",[]))))
+            conn.commit(); cur.close(); conn.close()
+            return
+        except Exception as e:
+            print(f"save_chat pg: {e}")
+            try: conn.close()
+            except: pass
+    try:
+        json.dump(chat, open(os.path.join(CHATS_DIR, f"{chat['id']}.json"),"w"), indent=2)
+    except: pass
 
 def list_chats():
-    chats = []
-    for f in sorted(os.listdir(CHATS_DIR), reverse=True):
-        if f.endswith(".json"):
-            try:
-                c = json.load(open(os.path.join(CHATS_DIR, f)))
-                chats.append({"id": c["id"], "title": c.get("title","New Chat"),
-                               "created": c.get("created",0), "mode": c.get("mode")})
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT id,title,created,mode FROM chats ORDER BY created DESC LIMIT 100")
+            rows = cur.fetchall()
+            cur.close(); conn.close()
+            return [{"id":r["id"],"title":r["title"],"created":float(r["created"] or 0),"mode":r["mode"]} for r in rows]
+        except Exception as e:
+            print(f"list_chats pg: {e}")
+            try: conn.close()
             except: pass
+    chats = []
+    try:
+        for f in sorted(os.listdir(CHATS_DIR), reverse=True):
+            if f.endswith(".json"):
+                try:
+                    c = json.load(open(os.path.join(CHATS_DIR, f)))
+                    chats.append({"id":c["id"],"title":c.get("title","New Chat"),
+                                  "created":c.get("created",0),"mode":c.get("mode")})
+                except: pass
+    except: pass
     return chats
+
+def delete_chat_from_db(cid):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM chats WHERE id=%s", (cid,))
+            conn.commit(); cur.close(); conn.close(); return
+        except Exception as e:
+            print(f"delete_chat pg: {e}")
+            try: conn.close()
+            except: pass
+    p = os.path.join(CHATS_DIR, f"{cid}.json")
+    if os.path.exists(p): os.remove(p)
+
+def save_preview(pid, html):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO previews (id, html, created) VALUES (%s,%s,%s)
+                ON CONFLICT (id) DO UPDATE SET html=EXCLUDED.html
+            """, (pid, html, time.time()))
+            conn.commit(); cur.close(); conn.close(); return
+        except Exception as e:
+            print(f"save_preview pg: {e}")
+            try: conn.close()
+            except: pass
+    PREVIEW_STORE[pid] = html
+
+def load_preview(pid):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT html FROM previews WHERE id=%s", (pid,))
+            row = cur.fetchone()
+            cur.close(); conn.close()
+            if row: return row["html"]
+        except Exception as e:
+            print(f"load_preview pg: {e}")
+            try: conn.close()
+            except: pass
+    return PREVIEW_STORE.get(pid)
 
 def auto_title(message):
     words = message.strip().split()[:7]
@@ -1269,7 +1414,15 @@ function addTyping(){
   document.getElementById('chat').appendChild(d);scrollToBottom();
 }
 function removeTyping(){var e=document.getElementById('typing');if(e)e.remove();}
-function openPreviewFile(path){document.getElementById('prev-modal').classList.add('on');document.getElementById('prev-frame').src='/file?path='+encodeURIComponent(path);}
+function openPreviewFile(path){
+  document.getElementById('prev-modal').classList.add('on');
+  // If already a full route (/preview/xxx), use directly; otherwise use /file?path=
+  if(path.startsWith('/preview/')||path.startsWith('http')){
+    document.getElementById('prev-frame').src=path;
+  } else {
+    document.getElementById('prev-frame').src='/file?path='+encodeURIComponent(path);
+  }
+}
 function openPreviewCode(code){document.getElementById('prev-modal').classList.add('on');var b=new Blob([code],{type:'text/html'});document.getElementById('prev-frame').src=URL.createObjectURL(b);}
 function closePreview(){document.getElementById('prev-modal').classList.remove('on');}
 
@@ -1359,8 +1512,7 @@ def load_chat_route():
 @app.route("/delete_chat", methods=["POST"])
 def delete_chat_route():
     cid = request.get_json().get("chat_id","")
-    p = chat_path(cid)
-    if os.path.exists(p): os.remove(p)
+    delete_chat_from_db(cid)
     return jsonify({"ok": True})
 
 @app.route("/clear", methods=["POST"])
@@ -1372,6 +1524,28 @@ def clear():
         chat["messages"] = []
         save_chat(chat)
     return jsonify({"ok": True})
+
+@app.route("/preview/<pid>")
+def serve_preview(pid):
+    html = load_preview(pid)
+    if not html: return "<h2 style='font-family:sans-serif;padding:20px'>Preview expired. Ask XenoAI again to regenerate.</h2>", 404
+    # Inject API proxy script so fetch('/api/...') works
+    proxy = """<script>
+(function(){
+  var _f=window.fetch;
+  window.fetch=function(url,opts){
+    if(typeof url==='string'&&(url.startsWith('/api')||url.startsWith('/health'))){
+      url=window.location.origin+url;
+    }
+    return _f(url,opts);
+  };
+})();
+</script>"""
+    if '</head>' in html:
+        html = html.replace('</head>', proxy+'</head>', 1)
+    else:
+        html = proxy + html
+    return html, 200, {"Content-Type": "text/html"}
 
 @app.route("/file")
 def serve_file():
@@ -1784,7 +1958,14 @@ def chat():
             # Find HTML and attach preview
             html_files = [s for s in saved if s["lang"]=="html" and s.get("path")]
             if html_files:
-                reply += f"\n\n[PREVIEW_FILE:{html_files[0]['path']}]"
+                # Store HTML in memory for preview (works on Railway)
+                pid = uuid.uuid4().hex[:12]
+                try:
+                    html_content = open(html_files[0]["path"]).read()
+                    save_preview(pid, html_content)
+                    reply += f"\n\n[PREVIEW_FILE:/preview/{pid}]"
+                except:
+                    reply += f"\n\n[PREVIEW_FILE:{html_files[0]['path']}]"
                 chat["messages"][-1]["content"] = reply
             elif not html_files and not has_html:
                 reply += "\n\n⚠️ Could not generate index.html — try asking again"
