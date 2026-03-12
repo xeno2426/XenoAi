@@ -688,6 +688,68 @@ def ask_groq_vision(prompt, image_b64, image_mime):
         return f"⚠️ Vision error: {data.get('error',{}).get('message','Unknown')}"
     except Exception as e: return f"⚠️ Vision error: {e}"
 
+# ─── GEMINI API ──────────────────────────────────────────────────────────────
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY","")
+
+GEMINI_PLANNER_PROMPT = """You are XenoAI's Strategic Planner. Your job is to:
+1. Read the user's request carefully
+2. Analyze what they REALLY want (not just what they said)
+3. Output an ENHANCED, detailed prompt for the code builder
+
+Format your output as:
+## ENHANCED PROMPT
+[Rewrite the user's request with full technical detail, exact feature list, UI requirements, data structures needed]
+
+## BUILD PLAN
+[Step by step what needs to be built]
+
+## TECHNICAL SPEC
+[Stack, routes, data models, frontend components, edge cases to handle]
+
+## ANTI-PATTERNS TO AVOID
+[Common mistakes the builder should avoid for this specific request]
+
+Be specific, be complete, be technical. The builder will follow your spec exactly."""
+
+def ask_gemini(prompt, system=None):
+    """Call Gemini Flash via REST API."""
+    if not GEMINI_API_KEY:
+        return None, "No GEMINI_API_KEY set"
+    try:
+        contents = []
+        if system:
+            contents.append({"role":"user","parts":[{"text":f"[SYSTEM]\n{system}"}]})
+            contents.append({"role":"model","parts":[{"text":"Understood. I will follow these instructions."}]})
+        contents.append({"role":"user","parts":[{"text":prompt}]})
+
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            json={"contents": contents,
+                  "generationConfig":{"temperature":0.7,"maxOutputTokens":4096}},
+            timeout=30
+        )
+        data = r.json()
+        if "candidates" in data:
+            return data["candidates"][0]["content"]["parts"][0]["text"], None
+        err = data.get("error",{}).get("message","Unknown Gemini error")
+        return None, err
+    except Exception as e:
+        return None, str(e)
+
+def ask_deepseek_review(code_reply):
+    """Ask DeepSeek R1 on Groq to review and fix the code."""
+    review_prompt = f"""Review this code for bugs, security issues, and improvements.
+Fix any bugs you find. Output the COMPLETE corrected code (all files).
+If code is good, output it as-is with a brief note.
+
+CODE TO REVIEW:
+{code_reply[:6000]}"""
+    return ask_groq(
+        [{"role":"user","content":review_prompt}],
+        model="deepseek-r1-distill-llama-70b"
+    )
+
 # ─── HTML UI ──────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
@@ -1293,7 +1355,13 @@ function setMode(m){
 function clearMode(){
   curMode=null;
   document.getElementById('mode-indicator').classList.remove('on');
-  document.getElementById('model-badge').textContent='Qwen3-32b';
+  // Check pipeline status
+fetch('/status').then(r=>r.json()).then(d=>{
+  var badge = document.getElementById('model-badge');
+  if(d.gemini) badge.textContent = '⚡ Gemini→Groq→DS';
+  else badge.textContent = 'Qwen3-32b';
+  badge.title = 'Pipeline: ' + d.pipeline;
+});
   addSys('⚙ Default mode');
   fetch('/set_mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:curChatId,mode:null})});
 }
@@ -1321,7 +1389,13 @@ function delChat(e,cid){
 function newChat(){
   curChatId=null; curMode=null;
   document.getElementById('mode-indicator').classList.remove('on');
-  document.getElementById('model-badge').textContent='Qwen3-32b';
+  // Check pipeline status
+fetch('/status').then(r=>r.json()).then(d=>{
+  var badge = document.getElementById('model-badge');
+  if(d.gemini) badge.textContent = '⚡ Gemini→Groq→DS';
+  else badge.textContent = 'Qwen3-32b';
+  badge.title = 'Pipeline: ' + d.pipeline;
+});
   document.getElementById('chat').innerHTML='<div class="sys-msg">New chat</div>';
   document.getElementById('header-title').textContent='New Chat';
   msgCount=0; updateCount(); closeSidebar();
@@ -1546,6 +1620,20 @@ def serve_preview(pid):
     else:
         html = proxy + html
     return html, 200, {"Content-Type": "text/html"}
+
+@app.route("/status")
+def status():
+    db_ok = get_db() is not None
+    return jsonify({
+        "groq":    bool(GROQ_API_KEY),
+        "gemini":  bool(GEMINI_API_KEY),
+        "db":      db_ok,
+        "pipeline": "gemini→groq→deepseek" if GEMINI_API_KEY else "groq-only"
+    })
+
+@app.route("/health")
+def health():
+    return jsonify({"status":"ok"})
 
 @app.route("/file")
 def serve_file():
@@ -1902,13 +1990,51 @@ def chat():
             install_ctx = "\n[ACTUAL INSTALL RESULTS — use only these packages]:\n" + "\n".join(install_log)
             combined = combined + install_ctx
 
-    messages = [{"role":"system","content":system}] + history[-8:] + [{"role":"user","content":combined}]
-    reply = ask_groq(messages)
+    # ── PIPELINE: Gemini → Groq → DeepSeek ──
+    pipeline_log = []
+    enhanced_prompt = combined  # default: use original if Gemini fails
+
+    if is_build_request(user_msg) and GEMINI_API_KEY:
+        # Stage 1: Gemini enhances the prompt
+        pipeline_log.append("🧠 **Gemini** → analyzing & enhancing your request...")
+        gemini_input = f"User request: {user_msg}\n\nContext: Building for Railway-hosted Flask app. Machine: {mem.get('machine_type','unknown')}. Installed packages: {', '.join(mem['installed_packages'][-10:]) or 'none'}"
+        gemini_out, gemini_err = ask_gemini(gemini_input, system=GEMINI_PLANNER_PROMPT)
+        if gemini_out:
+            enhanced_prompt = combined + f"\n\n[GEMINI ENHANCED SPEC]:\n{gemini_out}\n[END SPEC]"
+            pipeline_log.append("✅ **Gemini** enhanced your prompt with full technical spec")
+        else:
+            pipeline_log.append(f"⚠️ **Gemini** unavailable ({gemini_err}) — using original prompt")
+
+    # Stage 2: Groq builds from enhanced prompt
+    if pipeline_log:
+        pipeline_log.append("⚡ **Groq Llama 70B** → building...")
+    messages = [{"role":"system","content":system}] + history[-8:] + [{"role":"user","content":enhanced_prompt}]
+    reply = ask_groq(messages, model="llama-3.3-70b-versatile" if is_build_request(user_msg) else "qwen/qwen3-32b")
+
+    # Stage 3: DeepSeek reviews code (only on build requests)
+    if is_build_request(user_msg) and GEMINI_API_KEY and "```" in reply:
+        pipeline_log.append("🔍 **DeepSeek R1** → reviewing code for bugs...")
+        reviewed = ask_deepseek_review(reply)
+        if reviewed and "```" in reviewed and not reviewed.startswith("⚠️"):
+            reply = reviewed
+            pipeline_log.append("✅ **DeepSeek R1** reviewed & verified")
+        else:
+            pipeline_log.append("⚠️ **DeepSeek R1** skipped (no fixes needed)")
+
     chat["messages"].append({"role":"assistant","content":reply})
     if chat["title"]=="New Chat" and display: chat["title"]=auto_title(display)
 
-    # Prepend real install log to reply so user sees actual results
-    if install_log:
+    # Build pipeline header
+    if install_log or pipeline_log:
+        header_parts = []
+        if pipeline_log:
+            header_parts.append("**🚀 Pipeline:**\n" + "\n".join(pipeline_log))
+        if install_log:
+            header_parts.append("**⚡ Installs:**\n" + "\n".join(install_log))
+        install_header = "\n".join(header_parts) + "\n\n---\n\n"
+        reply = install_header + reply
+        chat["messages"][-1]["content"] = reply
+    elif install_log:
         install_header = "**⚡ Real installs ran:**\n" + "\n".join(install_log) + "\n\n---\n\n"
         reply = install_header + reply
         chat["messages"][-1]["content"] = reply
