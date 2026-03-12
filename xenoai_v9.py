@@ -1374,7 +1374,27 @@ def serve_file():
     mime = {"html":"text/html","css":"text/css","js":"application/javascript",
             "pdf":"application/pdf","png":"image/png","jpg":"image/jpeg",
             "jpeg":"image/jpeg","gif":"image/gif","webp":"image/webp"}.get(ext,"text/plain")
-    return open(path,"rb").read(), 200, {"Content-Type": mime}
+    content = open(path,"rb").read()
+    # For HTML files: inject API proxy so fetch('/api/...') works in preview iframe
+    if ext == "html":
+        proxy_script = b"""<script>
+// XenoAI Preview Bridge: proxy /api calls to parent XenoAI server
+(function(){
+  var _fetch = window.fetch;
+  window.fetch = function(url, opts){
+    if(typeof url === 'string' && url.startsWith('/api')){
+      // Replace relative /api with full Railway URL
+      var base = window.location.origin;
+      url = base + url;
+    }
+    return _fetch(url, opts);
+  };
+})();
+</script>"""
+        # Inject before </head>
+        if b'</head>' in content:
+            content = content.replace(b'</head>', proxy_script + b'</head>', 1)
+    return content, 200, {"Content-Type": mime}
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -1661,10 +1681,56 @@ def chat():
     # ── Normal chat ──
     chat["messages"].append({"role":"user","content":combined,"display":display})
     history = [{"role":m["role"],"content":m["content"]} for m in chat["messages"] if m["role"] in ("user","assistant")]
-    messages = [{"role":"system","content":system}] + history[-8:]
+
+    # ── PRE-BUILD: Ask AI for package list FIRST, install them, then full build ──
+    install_log = []
+    if is_build_request(user_msg):
+        # Step 1: Ask AI what packages are needed (fast, structured)
+        pkg_probe = ask_groq([
+            {"role":"system","content":"You are a Python package analyzer. Reply with ONLY a comma-separated list of pip package names needed for this task. Nothing else. No explanations. If stdlib is enough, reply: none"},
+            {"role":"user","content":f"Task: {user_msg}\nWhat pip packages are needed?"}
+        ], model="llama-3.3-70b-versatile")
+
+        # Parse package list
+        pkg_probe = re.sub(r'<think>.*?</think>','',pkg_probe,flags=re.DOTALL).strip()
+        if pkg_probe.lower() not in ("none","","stdlib"):
+            raw_pkgs = [p.strip().lower() for p in re.split(r'[,\s]+', pkg_probe) if p.strip() and len(p.strip()) < 40]
+            # Filter out garbage
+            raw_pkgs = [p for p in raw_pkgs if re.match(r'^[a-z0-9][a-z0-9._-]*$', p)][:8]
+
+            for pkg in raw_pkgs:
+                is_heavy = any(h in pkg for h in ["opencv","tensorflow","torch","moviepy","pandas","scipy","transformers","playwright","keras","nltk","sklearn"])
+                if is_heavy:
+                    install_log.append(f"⚠️ `{pkg}` is heavy — skipped (ask explicitly to install)")
+                    continue
+                # Pre-flight check
+                if check_package_installed(pkg):
+                    install_log.append(f"⏭ `{pkg}` already installed")
+                    continue
+                # Actually install it
+                result = smart_install(pkg, mem)
+                if result["status"] == "installed":
+                    install_log.append(f"✅ Installed `{pkg}` (attempt {result.get('attempt',1)})")
+                elif result["status"] == "already_installed":
+                    install_log.append(f"⏭ `{pkg}` already existed")
+                else:
+                    install_log.append(f"❌ `{pkg}` failed — will use stdlib alternative")
+
+        # Inject install log into context so AI knows what's available
+        if install_log:
+            install_ctx = "\n[ACTUAL INSTALL RESULTS — use only these packages]:\n" + "\n".join(install_log)
+            combined = combined + install_ctx
+
+    messages = [{"role":"system","content":system}] + history[-8:] + [{"role":"user","content":combined}]
     reply = ask_groq(messages)
     chat["messages"].append({"role":"assistant","content":reply})
     if chat["title"]=="New Chat" and display: chat["title"]=auto_title(display)
+
+    # Prepend real install log to reply so user sees actual results
+    if install_log:
+        install_header = "**⚡ Real installs ran:**\n" + "\n".join(install_log) + "\n\n---\n\n"
+        reply = install_header + reply
+        chat["messages"][-1]["content"] = reply
 
     # ── Auto-save code blocks on build requests ──
     extra = {}
@@ -1672,7 +1738,6 @@ def chat():
         proj_name = re.sub(r'[^a-z0-9_]', '_', display[:30].lower().strip())
         workspace, saved = extract_and_save_code_blocks(reply, proj_name)
         if saved:
-            # Update env memory with project
             mem2 = load_env_memory()
             mem2["projects"][proj_name] = {
                 "workspace": workspace,
@@ -1680,18 +1745,13 @@ def chat():
                 "created": time.time()
             }
             save_env_memory(mem2)
-            # Build saved files note
-            file_links = []
-            for s in saved:
-                if s.get("path"):
-                    file_links.append(f"[PREVIEW_FILE:{s['path']}]" if s["lang"]=="html" else f"`{s['filename']}`")
-            if file_links:
-                extra["saved_files"] = saved
-                extra["workspace"]   = workspace
-                # Append preview link to reply for HTML files
-                html_files = [s for s in saved if s["lang"]=="html" and s.get("path")]
-                if html_files:
-                    reply += f"\n\n[PREVIEW_FILE:{html_files[0]['path']}]"
+            extra["saved_files"] = saved
+            extra["workspace"]   = workspace
+            # Auto-inject Flask route to serve workspace for preview
+            html_files = [s for s in saved if s["lang"]=="html" and s.get("path")]
+            if html_files:
+                reply += f"\n\n[PREVIEW_FILE:{html_files[0]['path']}]"
+                chat["messages"][-1]["content"] = reply
 
     save_chat(chat)
     return jsonify({"reply":reply,"chat_id":chat_id,"title":chat["title"], **extra})
