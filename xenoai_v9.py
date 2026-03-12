@@ -238,6 +238,13 @@ NEVER retry the exact same failing command.
 NEVER give up without explaining WHY it failed.
 
 ━━━ PHASE 6: BUILD ━━━
+ANTI-TRUNCATION RULE (HIGHEST PRIORITY):
+- NEVER say "showing critical sections", "key parts", "abbreviated", "truncated"
+- NEVER show partial code. ALWAYS output 100% complete files.
+- If a file is long, output ALL of it. There is NO token limit concern — write everything.
+- Every ```python block must be a COMPLETE runnable app.py from import to app.run()
+- Every ```html block must be COMPLETE from <!DOCTYPE html> to </html>
+- If you cannot fit both files, output app.py first COMPLETE, then index.html COMPLETE.
 - Write complete code with ALL imports at top
 - Only import packages confirmed installed
 - If package failed, use stdlib alternative
@@ -1737,6 +1744,33 @@ def chat():
     if is_build_request(user_msg):
         proj_name = re.sub(r'[^a-z0-9_]', '_', display[:30].lower().strip())
         workspace, saved = extract_and_save_code_blocks(reply, proj_name)
+
+        # ── FALLBACK: AI truncated — request full files separately ──
+        has_html = any(s["lang"]=="html" for s in saved)
+        has_py   = any(s["lang"] in ("python","py") for s in saved)
+
+        if not has_html or not has_py:
+            # Ask AI to output ONLY the missing complete file
+            missing = []
+            if not has_py:   missing.append("app.py (complete Python Flask backend)")
+            if not has_html: missing.append("index.html (complete HTML frontend)")
+
+            fallback_reply = ask_groq([
+                {"role":"system","content":"Output ONLY the requested complete file(s). No explanations. No truncation. Full code from first line to last line."},
+                {"role":"user","content":f"Original task: {user_msg}\n\nPrevious response was truncated. Now output ONLY these complete files:\n" + "\n".join(missing)}
+            ], model="llama-3.3-70b-versatile")
+
+            # Extract from fallback
+            _, fallback_saved = extract_and_save_code_blocks(fallback_reply, proj_name)
+            saved = saved + [s for s in fallback_saved if s["filename"] not in [x["filename"] for x in saved]]
+
+            # Append note to reply
+            if fallback_saved:
+                reply += "\n\n---\n\n**📁 Full files saved** (AI had truncated, fetched separately):"
+                for s in fallback_saved:
+                    reply += f"\n- `{s['filename']}`"
+                chat["messages"][-1]["content"] = reply
+
         if saved:
             mem2 = load_env_memory()
             mem2["projects"][proj_name] = {
@@ -1747,10 +1781,13 @@ def chat():
             save_env_memory(mem2)
             extra["saved_files"] = saved
             extra["workspace"]   = workspace
-            # Auto-inject Flask route to serve workspace for preview
+            # Find HTML and attach preview
             html_files = [s for s in saved if s["lang"]=="html" and s.get("path")]
             if html_files:
                 reply += f"\n\n[PREVIEW_FILE:{html_files[0]['path']}]"
+                chat["messages"][-1]["content"] = reply
+            elif not html_files and not has_html:
+                reply += "\n\n⚠️ Could not generate index.html — try asking again"
                 chat["messages"][-1]["content"] = reply
 
     save_chat(chat)
