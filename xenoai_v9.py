@@ -660,7 +660,7 @@ def ask_groq(messages, model="qwen/qwen3-32b"):
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization":f"Bearer {GROQ_API_KEY}","Content-Type":"application/json"},
             json={"model":model,"messages":fixed,"max_tokens":8192,"temperature":0.6},
-            timeout=60
+            timeout=120
         )
         data = r.json()
         if "choices" in data:
@@ -727,7 +727,7 @@ def ask_gemini(prompt, system=None):
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": contents,
                   "generationConfig":{"temperature":0.7,"maxOutputTokens":4096}},
-            timeout=30
+            timeout=60
         )
         data = r.json()
         if "candidates" in data:
@@ -744,7 +744,7 @@ Fix any bugs you find. Output the COMPLETE corrected code (all files).
 If code is good, output it as-is with a brief note.
 
 CODE TO REVIEW:
-{code_reply[:6000]}"""
+{code_reply[:12000]}"""
     return ask_groq(
         [{"role":"user","content":review_prompt}],
         model="deepseek-r1-distill-llama-70b"
@@ -1524,6 +1524,12 @@ function send(){
 // ── INIT ──
 fetch('/new_chat',{method:'POST'}).then(r=>r.json()).then(d=>curChatId=d.chat_id);
 loadSidebar();
+// Set pipeline badge on load
+fetch('/status').then(r=>r.json()).then(d=>{
+  var badge = document.getElementById('model-badge');
+  if(d.gemini) { badge.textContent='⚡ Gemini→Groq→DS'; badge.title='Pipeline: '+d.pipeline; }
+  else { badge.textContent='Qwen3-32b'; }
+});
 
 // Keep checking header visibility on resize/scroll
 window.addEventListener('resize', checkHeaderVisible);
@@ -1551,8 +1557,14 @@ def api_list_skills():
         # Extract description from frontmatter or first line
         desc = ""
         m = re.search(r"description:\s*(.+)", content)
-        if m: desc = m.group(1).strip()[:120]
-        else: desc = content.split("\n")[-1][:120] if content else ""
+        if m:
+            desc = m.group(1).strip()[:120]
+        else:
+            for line in content.split("\n"):
+                line = line.strip().lstrip("#").strip()
+                if line and len(line) > 10:
+                    desc = line[:120]
+                    break
         skills.append({"name": name, "desc": desc})
     return jsonify({"skills": skills})
 
@@ -1623,7 +1635,11 @@ def serve_preview(pid):
 
 @app.route("/status")
 def status():
-    db_ok = get_db() is not None
+    conn = get_db()
+    db_ok = conn is not None
+    if conn:
+        try: conn.close()
+        except: pass
     return jsonify({
         "groq":    bool(GROQ_API_KEY),
         "gemini":  bool(GEMINI_API_KEY),
@@ -2169,36 +2185,7 @@ def extract_and_save_code_blocks(reply, project_name=None):
 
     return workspace, saved
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-def fetch_url(url):
-    try:
-        if not url.startswith("http"): url="https://"+url
-        r = requests.get(url,timeout=10,headers={"User-Agent":"Mozilla/5.0"})
-        return re.sub(r"\s+"," ",re.sub(r"<[^>]+"," ",r.text)).strip()[:3000]
-    except Exception as e: return f"Fetch error: {e}"
-
-def read_file_from_disk(filepath):
-    try:
-        filepath = os.path.expanduser(filepath.strip())
-        if not os.path.exists(filepath): return f"File not found: {filepath}"
-        c = extract_file_content(filepath)
-        return c if c else f"[Image: {filepath}]"
-    except Exception as e: return f"Read error: {e}"
-
-def run_code(code):
-    try:
-        r=subprocess.run(["python3","-c",code],capture_output=True,text=True,timeout=10,cwd=BASE_DIR)
-        return (r.stdout+r.stderr).strip() or "No output."
-    except subprocess.TimeoutExpired: return "Timeout."
-    except Exception as e: return f"Error: {e}"
-
-def list_dir(path):
-    try:
-        path=os.path.expanduser(path.strip() or "~")
-        r=subprocess.run(["ls","-la",path],capture_output=True,text=True,timeout=5)
-        return r.stdout or r.stderr
-    except Exception as e: return f"Error: {e}"
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
