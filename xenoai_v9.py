@@ -724,7 +724,7 @@ def ask_gemini(prompt, system=None):
         contents.append({"role":"user","parts":[{"text":prompt}]})
 
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}",
             json={"contents": contents,
                   "generationConfig":{"temperature":0.7,"maxOutputTokens":4096}},
             timeout=60
