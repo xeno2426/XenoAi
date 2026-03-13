@@ -724,7 +724,7 @@ def ask_gemini(prompt, system=None):
         contents.append({"role":"user","parts":[{"text":prompt}]})
 
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}",
             json={"contents": contents,
                   "generationConfig":{"temperature":0.7,"maxOutputTokens":4096}},
             timeout=60
@@ -1972,7 +1972,7 @@ def chat():
     if is_build_request(user_msg):
         # Step 1: Ask AI what packages are needed (fast, structured)
         pkg_probe = ask_groq([
-            {"role":"system","content":"You are a Python package analyzer. Reply with ONLY a comma-separated list of pip package names needed for this task. Nothing else. No explanations. If stdlib is enough, reply: none"},
+            {"role":"system","content":"You are a Python package analyzer. Reply with ONLY a comma-separated list of pip package names. ONLY include packages NOT in Python stdlib. NEVER include pandas, matplotlib, seaborn, numpy, django, beautifulsoup4 unless explicitly asked. Max 4 packages. If stdlib is enough, reply: none"},
             {"role":"user","content":f"Task: {user_msg}\nWhat pip packages are needed?"}
         ], model="llama-3.3-70b-versatile")
 
