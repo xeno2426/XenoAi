@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-import os, json, subprocess, requests, re, base64, uuid, time
+import os, json, subprocess, requests, re, base64, uuid, time, hashlib, hmac
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session, redirect, url_for
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
@@ -10,6 +10,7 @@ except ImportError:
     HAS_PG = False
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "xenoai-secret-" + uuid.uuid4().hex)
 GROQ_API_KEY  = os.environ.get("GROQ_API_KEY", "")
 
 # In-memory fallback preview store (used if no DB)
@@ -45,13 +46,27 @@ def init_db():
     try:
         cur = conn.cursor()
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created FLOAT DEFAULT 0
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 id TEXT PRIMARY KEY,
+                user_id TEXT DEFAULT NULL,
                 title TEXT DEFAULT 'New Chat',
                 created FLOAT DEFAULT 0,
                 mode TEXT,
                 messages JSONB DEFAULT '[]'::jsonb
             )
+        """)
+        # Add user_id column if it doesn't exist (migration)
+        cur.execute("""
+            ALTER TABLE chats ADD COLUMN IF NOT EXISTS user_id TEXT DEFAULT NULL
         """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS previews (
@@ -71,7 +86,62 @@ def init_db():
 
 init_db()
 
-# ─── SKILLS LOADER ────────────────────────────────────────────────────────────
+# ─── AUTH HELPERS ─────────────────────────────────────────────────────────────
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def check_password(password, hashed):
+    return hmac.compare_digest(hash_password(password), hashed)
+
+def get_current_user():
+    return session.get("user_id")
+
+def get_current_username():
+    return session.get("username", "User")
+
+def require_auth():
+    """Returns user_id if logged in, else None."""
+    return session.get("user_id")
+
+def create_user(username, email, password):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            uid = uuid.uuid4().hex[:12]
+            cur.execute(
+                "INSERT INTO users (id, username, email, password_hash, created) VALUES (%s,%s,%s,%s,%s)",
+                (uid, username.lower().strip(), email.lower().strip(), hash_password(password), time.time())
+            )
+            conn.commit(); cur.close(); conn.close()
+            return uid, None
+        except Exception as e:
+            try: conn.close()
+            except: pass
+            if "unique" in str(e).lower():
+                if "username" in str(e).lower(): return None, "Username already taken"
+                if "email" in str(e).lower(): return None, "Email already registered"
+            return None, str(e)
+    return None, "Database unavailable"
+
+def verify_user(username_or_email, password):
+    conn = get_db()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT * FROM users WHERE username=%s OR email=%s",
+                (username_or_email.lower().strip(), username_or_email.lower().strip())
+            )
+            row = cur.fetchone(); cur.close(); conn.close()
+            if row and check_password(password, row["password_hash"]):
+                return row["id"], row["username"], None
+            return None, None, "Invalid username or password"
+        except Exception as e:
+            try: conn.close()
+            except: pass
+    return None, None, "Database unavailable"
 
 def load_skill(name):
     """Load full SKILL.md content for a named skill."""
@@ -312,34 +382,31 @@ When user asks to build any "app", "tool", "website", "dashboard", "tracker", "m
 ALWAYS build BOTH:
   1. backend: app.py (Flask + SQLite, full REST API, /health endpoint)
      - Flask serves index.html at '/' via send_file('index.html')
-  2. frontend: index.html — DUAL-MODE (MANDATORY):
+  2. frontend: index.html — ONE SINGLE FILE + DUAL-MODE (MANDATORY)
 
-     DUAL-MODE means index.html works in TWO ways:
-     MODE A — Standalone preview (no backend): uses localStorage for all data
-     MODE B — Connected (with Flask running): uses fetch() to talk to API
+⚠️ SINGLE FILE HTML — HIGHEST PRIORITY RULE:
+- index.html must be ONE complete self-contained file from <!DOCTYPE html> to </html>
+- ALL CSS goes inside <style> tags in index.html. ZERO external CSS files.
+- ALL JS goes inside <script> tags in index.html. ZERO external JS files.
+- NEVER use Jinja2 syntax: NO {% block %} NO {% extends %} NO {{ url_for() }} NO {% endblock %}
+- NEVER use render_template() for index.html — use send_file('index.html') ONLY
+- NEVER create base.html, menu.html, cart.html — ONE FILE ONLY
+- Jinja syntax in index.html = preview shows broken template tags = FAILURE
 
-     Detect which mode at runtime:
-     async function apiAvailable() {
-       try { await fetch('/health',{signal:AbortSignal.timeout(500)}); return true; }
-       catch { return false; }
-     }
-     Then: if(await apiAvailable()) { useFetchAPI() } else { useLocalStorage() }
+DUAL-MODE means index.html works in TWO ways:
+MODE A — Standalone (no backend): localStorage + hardcoded sample data
+MODE B — Connected (Flask running): fetch() to REST API
+Detect: try { await fetch('/health',{signal:AbortSignal.timeout(500)}); return true; } catch { return false; }
 
-     This means the Preview button shows a FULLY WORKING app instantly,
-     AND the real Flask app also works when deployed.
+SAMPLE DATA RULE: Always hardcode 4-5 sample items so preview works instantly with zero backend.
 
-DESIGN RULES FOR index.html (frontend-design skill — MANDATORY):
-- NEVER use Inter, Roboto, Arial, system-ui fonts. Pick unexpected Google Fonts.
-- Good pairings: Playfair Display + DM Sans, Space Mono + Outfit, Syne + Inter
-- CSS variables for all colors. One dominant color + sharp accent. Use hsl().
-- Glassmorphism, micro-animations, staggered load animations
-- Break the grid — asymmetry, overlap, diagonal flow
-- Gradient meshes, noise textures, dramatic shadows
-- WOW factor is MANDATORY. Generic = FAILURE.
-- Mobile responsive. Single file. CSS in <style>. JS in <script>.
+DESIGN RULES (MANDATORY):
+- NEVER use Inter, Roboto, Arial, system-ui. Use unexpected Google Fonts.
+- CSS variables for all colors. hsl() values. One dominant + sharp accent.
+- Glassmorphism, micro-animations, staggered load animations.
+- WOW factor MANDATORY. Generic = FAILURE. Mobile responsive.
 
-ONLY build API-only (no frontend) if user explicitly says "API only" or "backend only".
-Otherwise: ALWAYS fullstack dual-mode. No exceptions.
+ONLY build API-only if user explicitly says "API only". Otherwise: ALWAYS fullstack single-file dual-mode.
 
 ━━━ PHASE 7: AUTO-TEST ━━━
 After writing code, test it:
@@ -417,12 +484,13 @@ def save_chat(chat):
         try:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO chats (id, title, created, mode, messages)
-                VALUES (%s,%s,%s,%s,%s::jsonb)
+                INSERT INTO chats (id, user_id, title, created, mode, messages)
+                VALUES (%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT (id) DO UPDATE
                 SET title=EXCLUDED.title, mode=EXCLUDED.mode, messages=EXCLUDED.messages
-            """, (chat["id"], chat.get("title","New Chat"), chat.get("created",time.time()),
-                  chat.get("mode"), json.dumps(chat.get("messages",[]))))
+            """, (chat["id"], chat.get("user_id"), chat.get("title","New Chat"),
+                  chat.get("created",time.time()), chat.get("mode"),
+                  json.dumps(chat.get("messages",[]))))
             conn.commit(); cur.close(); conn.close()
             return
         except Exception as e:
@@ -433,12 +501,15 @@ def save_chat(chat):
         json.dump(chat, open(os.path.join(CHATS_DIR, f"{chat['id']}.json"),"w"), indent=2)
     except: pass
 
-def list_chats():
+def list_chats(user_id=None):
     conn = get_db()
     if conn:
         try:
             cur = conn.cursor()
-            cur.execute("SELECT id,title,created,mode FROM chats ORDER BY created DESC LIMIT 100")
+            if user_id:
+                cur.execute("SELECT id,title,created,mode FROM chats WHERE user_id=%s ORDER BY created DESC LIMIT 100", (user_id,))
+            else:
+                cur.execute("SELECT id,title,created,mode FROM chats WHERE user_id IS NULL ORDER BY created DESC LIMIT 100")
             rows = cur.fetchall()
             cur.close(); conn.close()
             return [{"id":r["id"],"title":r["title"],"created":float(r["created"] or 0),"mode":r["mode"]} for r in rows]
@@ -724,7 +795,7 @@ def ask_gemini(prompt, system=None):
         contents.append({"role":"user","parts":[{"text":prompt}]})
 
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             json={"contents": contents,
                   "generationConfig":{"temperature":0.7,"maxOutputTokens":4096}},
             timeout=60
@@ -1161,6 +1232,11 @@ body {
       <div class="logo-icon">⚡</div>
       <span class="logo-text">XenoAI<span class="logo-ver"> v9</span></span>
     </div>
+    <div id="user-info" style="display:flex;align-items:center;gap:7px;padding:5px 2px">
+      <span style="font-size:11px;color:var(--text3)">👤</span>
+      <span id="username-disp" style="font-size:11px;color:var(--text2);flex:1">...</span>
+      <a href="/logout" style="font-size:10px;color:var(--text3);text-decoration:none;padding:3px 8px;border:1px solid var(--border2);border-radius:5px">Logout</a>
+    </div>
     <button type="button" id="new-chat-btn" onclick="newChat()">＋ New Chat</button>
     <div id="mode-indicator">
       <span>⚙</span><span id="mode-disp">default</span>
@@ -1189,6 +1265,7 @@ body {
     <div id="header-title">New Chat</div>
     <span class="hbadge live" id="model-badge">Qwen3-32b</span>
     <span class="hbadge" id="msg-count">0 msgs</span>
+    <button type="button" id="logout-btn" onclick="window.location.href='/logout'" title="Logout" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:4px 6px;border-radius:7px;flex-shrink:0">⏏</button>
   </div>
 
   <!-- Tools -->
@@ -1530,6 +1607,10 @@ fetch('/status').then(r=>r.json()).then(d=>{
   if(d.gemini) { badge.textContent='⚡ Gemini→Groq→DS'; badge.title='Pipeline: '+d.pipeline; }
   else { badge.textContent='Qwen3-32b'; }
 });
+// Show username
+fetch('/me').then(r=>r.json()).then(d=>{
+  if(d.ok) document.getElementById('username-disp').textContent=d.username;
+});
 
 // Keep checking header visibility on resize/scroll
 window.addEventListener('resize', checkHeaderVisible);
@@ -1540,13 +1621,207 @@ checkHeaderVisible();
 </html>"""
 
 
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XenoAI — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#08080d;--bg2:#0f0f18;--bg3:#16161f;--border:#ffffff0c;--border2:#ffffff18;
+--text:#e2e2ef;--text2:#8080a0;--text3:#44445a;--accent:#7c6aff;--accent2:#00e5ff;
+--green:#00e59b;--red:#ff5c5c;--font:'Space Grotesk',sans-serif}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font)}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh;
+background:radial-gradient(ellipse at 20% 50%,#7c6aff12 0%,transparent 60%),
+radial-gradient(ellipse at 80% 20%,#00e5ff0a 0%,transparent 50%),var(--bg)}
+.card{width:100%;max-width:400px;padding:40px 36px;background:var(--bg2);
+border:1px solid var(--border2);border-radius:24px;box-shadow:0 24px 80px #00000060}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:32px}
+.logo-icon{width:38px;height:38px;background:linear-gradient(135deg,var(--accent),var(--accent2));
+border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px;
+box-shadow:0 0 20px #7c6aff44}
+.logo-text{font-size:20px;font-weight:700;letter-spacing:-.5px}
+.logo-ver{color:var(--text3);font-size:12px;font-weight:400;margin-left:2px}
+h2{font-size:22px;font-weight:700;margin-bottom:6px}
+.sub{color:var(--text2);font-size:13px;margin-bottom:28px}
+.tabs{display:flex;background:var(--bg3);border-radius:12px;padding:4px;margin-bottom:28px;gap:4px}
+.tab{flex:1;padding:8px;border:none;border-radius:9px;background:none;color:var(--text3);
+font-family:var(--font);font-size:13px;font-weight:500;cursor:pointer;transition:all .15s}
+.tab.active{background:var(--accent);color:#fff;box-shadow:0 4px 14px #7c6aff44}
+.field{margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--text2);font-weight:500;margin-bottom:6px;letter-spacing:.3px}
+input{width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:10px;
+padding:11px 14px;color:var(--text);font-family:var(--font);font-size:14px;outline:none;transition:border .15s}
+input:focus{border-color:#7c6aff55;box-shadow:0 0 0 3px #7c6aff12}
+input::placeholder{color:var(--text3)}
+.btn{width:100%;background:linear-gradient(135deg,var(--accent),#5a4fd8);color:#fff;
+border:none;border-radius:12px;padding:13px;font-family:var(--font);font-size:14px;
+font-weight:600;cursor:pointer;margin-top:8px;transition:opacity .15s;
+box-shadow:0 4px 20px #7c6aff44;letter-spacing:.2px}
+.btn:hover{opacity:.88}
+.btn:active{transform:scale(.98)}
+.err{background:#ff5c5c18;border:1px solid #ff5c5c33;color:var(--red);border-radius:10px;
+padding:10px 14px;font-size:13px;margin-bottom:16px;display:none}
+.err.show{display:block}
+.ok{background:#00e59b18;border:1px solid #00e59b33;color:var(--green);border-radius:10px;
+padding:10px 14px;font-size:13px;margin-bottom:16px;display:none}
+.ok.show{display:block}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <span class="logo-text">XenoAI<span class="logo-ver"> v9</span></span>
+  </div>
+  <div class="tabs">
+    <button class="tab active" id="tab-login" onclick="showTab('login')">Login</button>
+    <button class="tab" id="tab-register" onclick="showTab('register')">Create Account</button>
+  </div>
+
+  <!-- LOGIN FORM -->
+  <div id="form-login">
+    <h2>Welcome back</h2>
+    <p class="sub">Sign in to your account</p>
+    <div class="err" id="login-err"></div>
+    <div class="field">
+      <label>USERNAME OR EMAIL</label>
+      <input id="login-id" type="text" placeholder="your username or email" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>PASSWORD</label>
+      <input id="login-pw" type="password" placeholder="••••••••" autocomplete="current-password"
+        onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <button class="btn" onclick="doLogin()">Sign In →</button>
+  </div>
+
+  <!-- REGISTER FORM -->
+  <div id="form-register" style="display:none">
+    <h2>Create account</h2>
+    <p class="sub">Join XenoAI — it's free</p>
+    <div class="err" id="reg-err"></div>
+    <div class="ok" id="reg-ok"></div>
+    <div class="field">
+      <label>USERNAME</label>
+      <input id="reg-user" type="text" placeholder="choose a username" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>EMAIL</label>
+      <input id="reg-email" type="email" placeholder="you@example.com" autocomplete="email">
+    </div>
+    <div class="field">
+      <label>PASSWORD</label>
+      <input id="reg-pw" type="password" placeholder="min 6 characters" autocomplete="new-password"
+        onkeydown="if(event.key==='Enter')doRegister()">
+    </div>
+    <button class="btn" onclick="doRegister()">Create Account →</button>
+  </div>
+</div>
+<script>
+function showTab(t){
+  document.getElementById('form-login').style.display=t==='login'?'block':'none';
+  document.getElementById('form-register').style.display=t==='register'?'block':'none';
+  document.getElementById('tab-login').classList.toggle('active',t==='login');
+  document.getElementById('tab-register').classList.toggle('active',t==='register');
+}
+async function doLogin(){
+  var id=document.getElementById('login-id').value.trim();
+  var pw=document.getElementById('login-pw').value;
+  var err=document.getElementById('login-err');
+  err.classList.remove('show');
+  if(!id||!pw){err.textContent='Please fill all fields';err.classList.add('show');return;}
+  var r=await fetch('/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:id,password:pw})});
+  var d=await r.json();
+  if(d.ok){window.location.href='/';}
+  else{err.textContent=d.error||'Login failed';err.classList.add('show');}
+}
+async function doRegister(){
+  var u=document.getElementById('reg-user').value.trim();
+  var e=document.getElementById('reg-email').value.trim();
+  var p=document.getElementById('reg-pw').value;
+  var err=document.getElementById('reg-err');
+  var ok=document.getElementById('reg-ok');
+  err.classList.remove('show');ok.classList.remove('show');
+  if(!u||!e||!p){err.textContent='Please fill all fields';err.classList.add('show');return;}
+  if(p.length<6){err.textContent='Password must be at least 6 characters';err.classList.add('show');return;}
+  var r=await fetch('/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:u,email:e,password:p})});
+  var d=await r.json();
+  if(d.ok){ok.textContent='Account created! Signing you in...';ok.classList.add('show');
+    setTimeout(()=>window.location.href='/',800);}
+  else{err.textContent=d.error||'Registration failed';err.classList.add('show');}
+}
+</script>
+</body>
+</html>"""
+
 # ─── ROUTES ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index(): return HTML
+def index():
+    if not require_auth():
+        return redirect("/login")
+    return HTML
+
+@app.route("/login")
+def login_page():
+    if require_auth():
+        return redirect("/")
+    return LOGIN_HTML
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data = request.get_json()
+    username = data.get("username","").strip()
+    email    = data.get("email","").strip()
+    password = data.get("password","")
+    if not username or not email or not password:
+        return jsonify({"ok":False,"error":"All fields required"})
+    if len(password) < 6:
+        return jsonify({"ok":False,"error":"Password too short"})
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        return jsonify({"ok":False,"error":"Username: letters, numbers, underscore only"})
+    uid, err = create_user(username, email, password)
+    if err:
+        return jsonify({"ok":False,"error":err})
+    session["user_id"]   = uid
+    session["username"]  = username.lower()
+    session.permanent    = True
+    return jsonify({"ok":True})
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data     = request.get_json()
+    ident    = data.get("username","").strip()
+    password = data.get("password","")
+    uid, username, err = verify_user(ident, password)
+    if err:
+        return jsonify({"ok":False,"error":err})
+    session["user_id"]  = uid
+    session["username"] = username
+    session.permanent   = True
+    return jsonify({"ok":True})
+
+@app.route("/me")
+def me():
+    uid = require_auth()
+    if not uid: return jsonify({"ok":False})
+    return jsonify({"ok":True,"user_id":uid,"username":get_current_username()})
 
 @app.route("/conversations")
-def conversations(): return jsonify({"chats": list_chats()})
+def conversations():
+    uid = require_auth()
+    return jsonify({"chats": list_chats(uid)})
 
 @app.route("/list_skills")
 def api_list_skills():
@@ -1585,8 +1860,9 @@ def api_set_mode():
 
 @app.route("/new_chat", methods=["POST"])
 def new_chat_route():
+    uid  = require_auth()
     cid  = new_chat_id()
-    chat = {"id":cid,"title":"New Chat","created":time.time(),"messages":[],"mode":None}
+    chat = {"id":cid,"user_id":uid,"title":"New Chat","created":time.time(),"messages":[],"mode":None}
     save_chat(chat)
     return jsonify({"chat_id": cid})
 
@@ -1694,6 +1970,10 @@ def chat():
 
     if not chat_id: chat_id = new_chat_id()
     chat = load_chat(chat_id)
+    # Tag chat with current user
+    uid = require_auth()
+    if uid and not chat.get("user_id"):
+        chat["user_id"] = uid
 
     # ── File handling ──
     file_context = ""
@@ -1972,7 +2252,7 @@ def chat():
     if is_build_request(user_msg):
         # Step 1: Ask AI what packages are needed (fast, structured)
         pkg_probe = ask_groq([
-            {"role":"system","content":"You are a Python package analyzer. Reply with ONLY a comma-separated list of pip package names. ONLY include packages NOT in Python stdlib. NEVER include pandas, matplotlib, seaborn, numpy, django, beautifulsoup4 unless explicitly asked. Max 4 packages. If stdlib is enough, reply: none"},
+            {"role":"system","content":"You are a Python package analyzer. Reply with ONLY a comma-separated list of pip package names needed for this task. Nothing else. No explanations. If stdlib is enough, reply: none"},
             {"role":"user","content":f"Task: {user_msg}\nWhat pip packages are needed?"}
         ], model="llama-3.3-70b-versatile")
 
@@ -2155,6 +2435,10 @@ def extract_and_save_code_blocks(reply, project_name=None):
         lang = (lang or "").lower().strip()
         code = code.strip()
         if not code or len(code) < 20: continue
+
+        # Skip Jinja template files — they render as broken text in preview
+        if "{%" in code or "{% block" in code or "{% extends" in code:
+            continue
 
         filename = lang_to_file.get(lang)
         if not filename:
